@@ -49,8 +49,8 @@ final class DefaultAnydocClient implements AnydocClient {
 
     private final URI baseUri;
     private final URI convertUri;
-    private final URI ocrUri;
     private final URI jobsUri;
+    private final URI renderUri;
     private final URI healthUri;
     private final String token;
     private final Duration requestTimeout;
@@ -67,8 +67,8 @@ final class DefaultAnydocClient implements AnydocClient {
                         CircuitBreakerConfig circuitBreakerConfig) {
         this.baseUri = baseUri;
         this.convertUri = baseUri.resolve("/v1/convert");
-        this.ocrUri = baseUri.resolve("/v1/ocr");
         this.jobsUri = baseUri.resolve("/v1/jobs");
+        this.renderUri = baseUri.resolve("/v1/pdf/render");
         this.healthUri = baseUri.resolve("/healthz");
         this.token = token;
         this.requestTimeout = requestTimeout;
@@ -109,9 +109,9 @@ final class DefaultAnydocClient implements AnydocClient {
                 : opts.requestId().trim();
 
         // ---- 客户端单飞：相同内容的并发调用共享同一次转换，避免重复网络往返 ----
-        // 键含 ocr_assets 开关：开/关产物不同，不可共享结果
+        // 键含选项指纹：不同参数产物不同，不可共享结果
         String sfKey = sha256Hex(content) + ":" + fname + ":" + opts.includeAssets()
-                + ":" + opts.ocrAssets();
+                + ":" + opts.variantFingerprint();
         CompletableFuture<ConversionResult> fresh = new CompletableFuture<>();
         CompletableFuture<ConversionResult> existing = inflight.putIfAbsent(sfKey, fresh);
         if (existing != null) {
@@ -119,7 +119,8 @@ final class DefaultAnydocClient implements AnydocClient {
             try {
                 ConversionResult shared = existing.get();
                 return new ConversionResult(shared.markdown(), shared.format(), shared.elapsedMs(),
-                        shared.inputBytes(), rid, shared.assets(), shared.cacheHit(), shared.ocrApplied());
+                        shared.inputBytes(), rid, shared.assets(), shared.cacheHit(),
+                        shared.headersFooters(), shared.headersFootersStripped());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AnydocException("等待在途转换被中断", e, null, "interrupted", rid);
@@ -167,6 +168,13 @@ final class DefaultAnydocClient implements AnydocClient {
                 fireSuccess(rid, fname, result, startNanos);
                 return result;
             } catch (AnydocServiceException e) {
+                // 不可重试的瞬时故障（如服务端 504：对方已耗尽其超时预算，
+                // 立即重试只会重复消耗重型转换）：计入熔断并直接路由给调用方
+                if (!e.isRetryable()) {
+                    circuitBreaker.recordFailure();
+                    fireFailure(rid, fname, e, startNanos);
+                    throw e;
+                }
                 // 瞬时故障：按策略退避重试
                 lastFailure = e;
                 if (attempt < maxAttempts) {
@@ -243,24 +251,19 @@ final class DefaultAnydocClient implements AnydocClient {
     }
 
     /** 动态拼接转换 URI：include_assets + ocr_assets（v1.6 请求级动态开关）。 */
-    private URI convertUriFor(boolean includeAssets, Boolean ocrAssets) {
-        StringBuilder q = new StringBuilder();
-        if (includeAssets) {
-            q.append("include_assets=true");
-        }
-        if (ocrAssets != null) {
-            if (q.length() > 0) {
-                q.append('&');
-            }
-            q.append("ocr_assets=").append(ocrAssets);
-        }
-        return q.length() == 0 ? convertUri : baseUri.resolve("/v1/convert?" + q);
+    private URI convertUriFor(ConvertOptions opts) {
+        String q = opts.toQuery();   // v1.9：含动态 OCR 参数与 timeout（缺省项不携带）
+        return q.isEmpty() ? convertUri : baseUri.resolve("/v1/convert?" + q);
     }
 
     private ConversionResult doConvert(byte[] content, String filename, String rid, ConvertOptions opts) {
         MultipartBody body = MultipartBody.of("file", filename, content);
-        HttpRequest request = HttpRequest.newBuilder(convertUriFor(opts.includeAssets(), opts.ocrAssets()))
-                .timeout(requestTimeout)
+        // v1.9：若设置了服务端动态超时，HTTP 读取超时需覆盖它（+10s 余量接收 504 响应）
+        Duration httpTimeout = opts.timeoutSeconds() != null
+                ? Duration.ofSeconds(opts.timeoutSeconds() + 10L)
+                : requestTimeout;
+        HttpRequest request = HttpRequest.newBuilder(convertUriFor(opts))
+                .timeout(httpTimeout)
                 .header("Authorization", "Bearer " + token)
                 .header("X-Request-ID", rid)
                 .header("X-Content-SHA256", sha256Hex(content))   // 内容指纹：审计 + 服务端缓存亲和
@@ -287,109 +290,6 @@ final class DefaultAnydocClient implements AnydocClient {
     }
 
     // ------------------------------------------------------------------
-    // 独立 OCR（v1.6）：对单张图片/PDF 直接调用服务端本地 OCR
-    // ------------------------------------------------------------------
-
-    @Override
-    public OcrResult ocr(byte[] content, String filename) {
-        return ocr(content, filename, null);
-    }
-
-    @Override
-    public OcrResult ocr(byte[] content, String filename, String requestId) {
-        if (content == null || content.length == 0) {
-            throw new IllegalArgumentException("content 不能为空");
-        }
-        String fname = (filename == null || filename.isBlank()) ? "image.png" : filename.trim();
-        String rid = (requestId == null || requestId.isBlank())
-                ? UUID.randomUUID().toString().replace("-", "")
-                : requestId.trim();
-
-        // 熔断 + 重试（含 Retry-After 遵循），与转换同策略；OCR 结果无状态，不做单飞
-        if (!circuitBreaker.tryAcquire()) {
-            throw new AnydocCircuitOpenException(
-                    "熔断器开启：anydoc-service 近期失败率过高，冷却期内拒绝调用 [requestId=" + rid + "]");
-        }
-        int maxAttempts = retryPolicy.maxAttempts();
-        AnydocServiceException lastFailure = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                OcrResult result = doOcr(content, fname, rid);
-                circuitBreaker.recordSuccess();
-                return result;
-            } catch (AnydocServiceException e) {
-                lastFailure = e;
-                if (attempt < maxAttempts) {
-                    Duration backoff = retryPolicy.backoff(attempt);
-                    if (e instanceof AnydocUnavailableException unavailable
-                            && unavailable.retryAfterSeconds() > 0) {
-                        Duration retryAfter = Duration.ofSeconds(unavailable.retryAfterSeconds());
-                        if (retryAfter.compareTo(backoff) > 0) {
-                            backoff = retryAfter;
-                        }
-                    }
-                    sleep(backoff);
-                }
-            }
-        }
-        circuitBreaker.recordFailure();
-        throw lastFailure;
-    }
-
-    private OcrResult doOcr(byte[] content, String filename, String rid) {
-        MultipartBody body = MultipartBody.of("file", filename, content);
-        HttpRequest request = HttpRequest.newBuilder(ocrUri)
-                .timeout(requestTimeout)
-                .header("Authorization", "Bearer " + token)
-                .header("X-Request-ID", rid)
-                .header("Content-Type", "multipart/form-data; boundary=" + body.boundary())
-                .header("Accept", "application/json")
-                .POST(body.publisher())
-                .build();
-        HttpResponse<byte[]> response = send(request, rid);
-        return handleOcrResponse(response, rid);
-    }
-
-    private OcrResult handleOcrResponse(HttpResponse<byte[]> response, String rid) {
-        int status = response.statusCode();
-        byte[] body = response.body();
-        switch (status) {
-            case 200 -> {
-                OcrResponse parsed = parse(body, OcrResponse.class, rid);
-                return new OcrResult(parsed.text(), parsed.kind(), parsed.inputBytes(),
-                        parsed.elapsedMs(), rid);
-            }
-            case 401 ->
-                throw new UnauthorizedException(errorReason(body, "Token 缺失或错误，请检查配置"), rid);
-            case 413 ->
-                throw new DocumentTooLargeException(errorReason(body, "文件超过服务端大小上限"), rid);
-            case 415 ->
-                // 含 ocr_unavailable（引擎不可用）与 unsupported（输入类型不支持）
-                throw new UnsupportedDocumentException(
-                        errorReason(body, "OCR 引擎不可用或输入不支持"), errorCode(body), rid);
-            case 422 ->
-                throw new CorruptedDocumentException(
-                        errorReason(body, "OCR 识别失败（输入可能损坏）"), errorCode(body), rid);
-            case 429 ->
-                throw new AnydocUnavailableException(
-                        errorReason(body, "服务端限流（RPM 超限）"), retryAfterSeconds(response), rid);
-            case 503 ->
-                throw new AnydocUnavailableException(
-                        errorReason(body, "服务端过载（背压）"), retryAfterSeconds(response), rid);
-            case 504 ->
-                throw new AnydocTimeoutException(errorReason(body, "服务端 OCR 超时"), rid);
-            default -> {
-                if (status >= 500) {
-                    throw new AnydocServiceException("服务端故障: HTTP " + status, null, status,
-                            "http_" + status, rid);
-                }
-                throw new AnydocException("非预期响应: HTTP " + status, null, status,
-                        "unexpected", rid);
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
     // 异步任务（v1.7）：submitJob / jobStatus / convertAsync
     // ------------------------------------------------------------------
 
@@ -401,11 +301,13 @@ final class DefaultAnydocClient implements AnydocClient {
         ConvertOptions opts = options == null ? ConvertOptions.defaults() : options;
         String fname = (filename == null || filename.isBlank()) ? "document.bin" : filename.trim();
         String rid = (opts.requestId() == null || opts.requestId().isBlank())
-                ? UUID.randomUUID().toString().replace("-", "")
-                : opts.requestId().trim();
+                ? UUID.randomUUID().toString().replace("-", "") : opts.requestId().trim();
         MultipartBody body = MultipartBody.of("file", fname, content);
-        HttpRequest request = HttpRequest.newBuilder(jobsUriFor(opts.includeAssets(), opts.ocrAssets()))
-                .timeout(requestTimeout)
+        Duration httpTimeout = opts.timeoutSeconds() != null
+                ? Duration.ofSeconds(opts.timeoutSeconds() + 10L)
+                : requestTimeout;
+        HttpRequest request = HttpRequest.newBuilder(jobsUriFor(opts))
+                .timeout(httpTimeout)
                 .header("Authorization", "Bearer " + token)
                 .header("X-Request-ID", rid)
                 .header("Content-Type", "multipart/form-data; boundary=" + body.boundary())
@@ -420,7 +322,6 @@ final class DefaultAnydocClient implements AnydocClient {
             return new JobTicket(parsed.jobId(), parsed.status(),
                     Boolean.TRUE.equals(parsed.cacheHit()));
         }
-        // 提交阶段的错误与同步转换同契约（401/413/415/429/503/504/5xx）
         throw mapSubmitError(status, respBody, response, rid);
     }
 
@@ -448,7 +349,9 @@ final class DefaultAnydocClient implements AnydocClient {
                         parsed.result().elapsedMs(), parsed.result().inputBytes(), rid,
                         parsed.result().assets() == null ? List.of() : List.copyOf(parsed.result().assets()),
                         Boolean.TRUE.equals(parsed.result().cacheHit()),
-                        Boolean.TRUE.equals(parsed.result().ocrApplied()));
+                        parsed.result().headersFooters() == null
+                                ? List.of() : List.copyOf(parsed.result().headersFooters()),
+                        parsed.result().headersFootersStripped());
             }
             String errCode = parsed.error() == null ? null : parsed.error().code();
             String errReason = parsed.error() == null ? null : parsed.error().reason();
@@ -500,7 +403,7 @@ final class DefaultAnydocClient implements AnydocClient {
         String code = st.errorCode() == null ? "conversion_failed" : st.errorCode();
         String reason = st.errorReason() == null ? "异步任务失败" : st.errorReason();
         return switch (code) {
-            case "unsupported", "ocr_unavailable" ->
+            case "unsupported" ->
                     new UnsupportedDocumentException(reason, code, rid);
             case "encrypted" -> new EncryptedDocumentException(reason, rid);
             case "malformed", "missing_part", "resource_limit" ->
@@ -512,13 +415,14 @@ final class DefaultAnydocClient implements AnydocClient {
         };
     }
 
+    /** 提交阶段错误映射，语义与转换契约一致。 */
     private RuntimeException mapSubmitError(int status, byte[] body,
                                             HttpResponse<byte[]> response, String rid) {
         return switch (status) {
             case 401 -> new UnauthorizedException(errorReason(body, "Token 缺失或错误，请检查配置"), rid);
             case 413 -> new DocumentTooLargeException(errorReason(body, "文档超过服务端大小上限"), rid);
             case 415 -> new UnsupportedDocumentException(
-                    errorReason(body, "未知格式或 OCR 引擎不可用"), errorCode(body), rid);
+                    errorReason(body, "格式不支持"), errorCode(body), rid);
             case 429 -> new AnydocUnavailableException(
                     errorReason(body, "服务端限流（RPM 超限）"), retryAfterSeconds(response), rid);
             case 503 -> new AnydocUnavailableException(
@@ -535,19 +439,73 @@ final class DefaultAnydocClient implements AnydocClient {
         };
     }
 
-    /** 拼接 /v1/jobs 查询串（include_assets + ocr_assets，与转换路径同规则）。 */
-    private URI jobsUriFor(boolean includeAssets, Boolean ocrAssets) {
-        StringBuilder q = new StringBuilder();
-        if (includeAssets) {
-            q.append("include_assets=true");
+    // ------------------------------------------------------------------
+    // PDF 工具（v2.0 保留）：renderPdf（pypdfium2 页面渲染）
+    // ------------------------------------------------------------------
+
+    @Override
+    public PdfRenderResult renderPdf(byte[] content, RenderOptions options) {
+        if (content == null || content.length == 0) {
+            throw new IllegalArgumentException("content 不能为空");
         }
-        if (ocrAssets != null) {
-            if (q.length() > 0) {
-                q.append('&');
+        RenderOptions opts = options == null ? RenderOptions.defaults() : options;
+        String rid = UUID.randomUUID().toString().replace("-", "");
+        String query = opts.toQuery();
+        URI uri = query.isEmpty() ? renderUri : baseUri.resolve("/v1/pdf/render?" + query);
+        MultipartBody body = MultipartBody.of("file", "render.pdf", content);
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(requestTimeout)
+                .header("Authorization", "Bearer " + token)
+                .header("X-Request-ID", rid)
+                .header("Content-Type", "multipart/form-data; boundary=" + body.boundary())
+                .header("Accept", "application/json")
+                .POST(body.publisher())
+                .build();
+        HttpResponse<byte[]> response = send(request, rid);
+        int status = response.statusCode();
+        byte[] respBody = response.body();
+        if (status == 200) {
+            RenderResponse parsed = parse(respBody, RenderResponse.class, rid);
+            List<PdfRenderResult.RenderedPage> pages = parsed.pages() == null
+                    ? List.of()
+                    : parsed.pages().stream()
+                        .map(p -> new PdfRenderResult.RenderedPage(
+                                p.page(), p.width(), p.height(), p.mediaType(), p.dataB64()))
+                        .toList();
+            return new PdfRenderResult(parsed.totalPages(), parsed.rendered(), parsed.scale(),
+                    pages, parsed.inputBytes(), parsed.elapsedMs(), rid);
+        }
+        throw mapToolError(status, respBody, response, rid, "渲染");
+    }
+
+    /** 工具类端点（判定/渲染）的统一错误映射，语义与转换契约一致。 */
+    private RuntimeException mapToolError(int status, byte[] body,
+                                          HttpResponse<byte[]> response, String rid, String op) {
+        return switch (status) {
+            case 401 -> new UnauthorizedException(errorReason(body, "Token 缺失或错误，请检查配置"), rid);
+            case 413 -> new DocumentTooLargeException(errorReason(body, "文件超过服务端大小上限"), rid);
+            case 415 -> new UnsupportedDocumentException(
+                    errorReason(body, op + "失败：输入不支持"), errorCode(body), rid);
+            case 429 -> new AnydocUnavailableException(
+                    errorReason(body, "服务端限流（RPM 超限）"), retryAfterSeconds(response), rid);
+            case 503 -> new AnydocUnavailableException(
+                    errorReason(body, "服务端过载或停机（背压）"), retryAfterSeconds(response), rid);
+            case 504 -> new AnydocTimeoutException(errorReason(body, "服务端" + op + "超时"), rid);
+            default -> {
+                if (status >= 500) {
+                    yield new AnydocServiceException("服务端故障: HTTP " + status, null, status,
+                            "http_" + status, rid);
+                }
+                yield new AnydocException("非预期响应: HTTP " + status, null, status,
+                        "unexpected", rid);
             }
-            q.append("ocr_assets=").append(ocrAssets);
-        }
-        return q.length() == 0 ? jobsUri : baseUri.resolve("/v1/jobs?" + q);
+        };
+    }
+
+    /** 拼接 /v1/jobs 查询串（include_assets + ocr_assets，与转换路径同规则）。 */
+    private URI jobsUriFor(ConvertOptions opts) {
+        String q = opts.toQuery();   // v1.9：含动态 OCR 参数与 timeout
+        return q.isEmpty() ? jobsUri : baseUri.resolve("/v1/jobs?" + q);
     }
 
     private HttpResponse<byte[]> send(HttpRequest request, String rid) {
@@ -572,10 +530,12 @@ final class DefaultAnydocClient implements AnydocClient {
                 ConvertResponse parsed = parse(body, ConvertResponse.class, rid);
                 List<AssetInfo> assets = parsed.assets() == null
                         ? List.of() : List.copyOf(parsed.assets());
+                List<HeaderFooterInfo> hfs = parsed.headersFooters() == null
+                        ? List.of() : List.copyOf(parsed.headersFooters());
                 return new ConversionResult(parsed.markdown(), parsed.format(),
                         parsed.elapsedMs(), parsed.inputBytes(), rid, assets,
-                        Boolean.TRUE.equals(parsed.cacheHit()),
-                        Boolean.TRUE.equals(parsed.ocrApplied()));
+                        Boolean.TRUE.equals(parsed.cacheHit()), hfs,
+                        parsed.headersFootersStripped());
             }
             case 401 -> {
                 throw new UnauthorizedException(errorReason(body, "Token 缺失或错误，请检查配置"), rid);
@@ -585,7 +545,7 @@ final class DefaultAnydocClient implements AnydocClient {
             }
             case 415 -> {
                 throw new UnsupportedDocumentException(
-                        errorReason(body, "未知格式或扫描件（建议转 OCR 兜底）"), errorCode(body), rid);
+                        errorReason(body, "未知格式或无文本层扫描件（由上游 OCR 服务预处理）"), errorCode(body), rid);
             }
             case 422 -> {
                 String code = errorCode(body);
@@ -745,7 +705,8 @@ final class DefaultAnydocClient implements AnydocClient {
             @JsonProperty("input_bytes") int inputBytes,
             @JsonProperty("assets") List<AssetInfo> assets,
             @JsonProperty("cache_hit") Boolean cacheHit,
-            @JsonProperty("ocr_applied") Boolean ocrApplied) {
+            @JsonProperty("headers_footers") List<HeaderFooterInfo> headersFooters,
+            @JsonProperty("headers_footers_stripped") Integer headersFootersStripped) {
     }
 
     private record OcrResponse(
@@ -759,6 +720,23 @@ final class DefaultAnydocClient implements AnydocClient {
             @JsonProperty("job_id") String jobId,
             @JsonProperty("status") String status,
             @JsonProperty("cache_hit") Boolean cacheHit) {
+    }
+
+    private record RenderPageResponse(
+            @JsonProperty("page") int page,
+            @JsonProperty("width") int width,
+            @JsonProperty("height") int height,
+            @JsonProperty("media_type") String mediaType,
+            @JsonProperty("data_b64") byte[] dataB64) {
+    }
+
+    private record RenderResponse(
+            @JsonProperty("total_pages") int totalPages,
+            @JsonProperty("rendered") int rendered,
+            @JsonProperty("scale") double scale,
+            @JsonProperty("pages") List<RenderPageResponse> pages,
+            @JsonProperty("input_bytes") int inputBytes,
+            @JsonProperty("elapsed_ms") double elapsedMs) {
     }
 
     private record JobError(

@@ -65,7 +65,7 @@ class AnydocClientContractTest {
                     body));
             responder.respond(exchange);
         });
-        server.createContext("/v1/ocr", exchange -> {
+        server.createContext("/v1/jobs", exchange -> {
             byte[] body = exchange.getRequestBody().readAllBytes();
             LAST_REQUEST.set(new CapturedRequest(
                     exchange.getRequestHeaders().getFirst("Authorization"),
@@ -75,7 +75,7 @@ class AnydocClientContractTest {
                     body));
             responder.respond(exchange);
         });
-        server.createContext("/v1/jobs", exchange -> {
+        server.createContext("/v1/pdf/render", exchange -> {
             byte[] body = exchange.getRequestBody().readAllBytes();
             LAST_REQUEST.set(new CapturedRequest(
                     exchange.getRequestHeaders().getFirst("Authorization"),
@@ -269,52 +269,6 @@ class AnydocClientContractTest {
     }
 
     @Test
-    @DisplayName("v1.6：ConvertOptions.withOcrAssets(true) -> 请求携带 ocr_assets=true")
-    void convertWithOcrAssetsQueryParam() {
-        respondJson(200, """
-                {"markdown":"x","format":"docx","elapsed_ms":1.0,"input_bytes":3,"assets":[]}
-                """);
-        client.convert(DOC, "a.docx",
-                ConvertOptions.defaults().withIncludeAssets(true).withOcrAssets(true));
-        String path = LAST_REQUEST.get().path();
-        assertTrue(path.contains("include_assets=true"), path);
-        assertTrue(path.contains("ocr_assets=true"), path);
-
-        // 显式关闭同样下发；不调用则不携带该参数（跟随服务端全局配置）
-        client.convert(DOC, "a.docx", ConvertOptions.defaults().withOcrAssets(false));
-        assertTrue(LAST_REQUEST.get().path().contains("ocr_assets=false"));
-        client.convert(DOC, "a.docx", ConvertOptions.defaults());
-        assertTrue(!LAST_REQUEST.get().path().contains("ocr_assets"),
-                LAST_REQUEST.get().path());
-    }
-
-    @Test
-    @DisplayName("v1.6：ocr() 独立 OCR -> 200 解析 text/kind")
-    void ocrHappyPath() {
-        respondJson(200, """
-                {"text":"Total: 16000.50","kind":"image","input_bytes":123,"elapsed_ms":4.5}
-                """);
-        OcrResult result = client.ocr(new byte[]{1, 2, 3}, "img.png", "rid-ocr");
-        assertEquals("Total: 16000.50", result.text());
-        assertEquals("image", result.kind());
-        assertTrue(result.hasText());
-        assertEquals("rid-ocr", result.requestId());
-        assertTrue(LAST_REQUEST.get().path().startsWith("/v1/ocr"));
-        assertEquals("Bearer test-token", LAST_REQUEST.get().authorization());
-    }
-
-    @Test
-    @DisplayName("v1.6：ocr() 415 ocr_unavailable -> UnsupportedDocumentException.isOcrUnavailable()")
-    void ocrUnavailable() {
-        respondJson(415, """
-                {"detail":{"code":"ocr_unavailable","reason":"引擎不可用"}}
-                """);
-        UnsupportedDocumentException e = assertThrows(UnsupportedDocumentException.class,
-                () -> client.ocr(new byte[]{1}, "img.png"));
-        assertTrue(e.isOcrUnavailable());
-    }
-
-    @Test
     @DisplayName("v1.7：convertAsync 提交+轮询 -> succeeded 解析结果")
     void asyncJobHappyPath() throws IOException {
         java.util.concurrent.atomic.AtomicInteger polls = new java.util.concurrent.atomic.AtomicInteger();
@@ -331,7 +285,7 @@ class AnydocClientContractTest {
                 json = """
                         {"job_id":"j-1","status":"succeeded","format":"docx",
                          "result":{"markdown":"# ok","format":"docx","elapsed_ms":3.0,
-                                   "input_bytes":3,"assets":[],"cache_hit":false,"ocr_applied":false}}
+                                   "input_bytes":3,"assets":[],"cache_hit":false}}
                         """;
             }
             byte[] payload = json.getBytes(StandardCharsets.UTF_8);
@@ -383,6 +337,158 @@ class AnydocClientContractTest {
                 """);
         AnydocException e = assertThrows(AnydocException.class, () -> client.jobStatus("nope"));
         assertEquals(404, e.httpStatus());
+    }
+
+    @Test
+    @DisplayName("v1.8：renderPdf -> 200 解析位图（base64 自动解码）+ 选项查询串")
+    void renderPdfWithOptions() throws IOException {
+        respondJson(200, """
+                {"total_pages":3,"rendered":1,"scale":1.5,
+                 "pages":[{"page":1,"width":900,"height":1200,
+                           "media_type":"image/png","data_b64":"iVBORw0KGgo="}],
+                 "input_bytes":1000,"elapsed_ms":12.5}
+                """);
+        PdfRenderResult r = client.renderPdf(DOC,
+                RenderOptions.defaults().withPages("1").withScale(1.5).withFormat("png"));
+        assertEquals(3, r.totalPages());
+        assertEquals(1, r.rendered());
+        PdfRenderResult.RenderedPage p = r.pages().get(0);
+        assertEquals(1, p.page());
+        assertTrue(p.isPng());
+        assertTrue(p.data().length > 0);
+        String path = LAST_REQUEST.get().path();
+        assertTrue(path.contains("pages=1") && path.contains("scale=1.5")
+                && path.contains("format=png"), path);
+    }
+
+    @Test
+    @DisplayName("v1.8：renderPdf 非 PDF 输入 -> 415 UnsupportedDocumentException")
+    void renderPdfUnsupported() {
+        respondJson(415, """
+                {"detail":{"code":"unsupported","reason":"PDF 解析失败"}}
+                """);
+        assertThrows(UnsupportedDocumentException.class, () -> client.renderPdf(DOC));
+    }
+
+    @Test
+    @DisplayName("v2.2：withMaxPages -> 查询串携带 max_pages")
+    void maxPagesQuery() {
+        respondJson(200, """
+                {"markdown":"x","format":"pdf","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false}
+                """);
+        client.convert(DOC, "a.pdf", ConvertOptions.defaults().withMaxPages(50));
+        assertTrue(LAST_REQUEST.get().path().contains("max_pages=50"), LAST_REQUEST.get().path());
+        // 缺省不携带（保持服务端默认值）
+        client.convert(DOC, "b.pdf", ConvertOptions.defaults());
+        assertTrue(!LAST_REQUEST.get().path().contains("max_pages"), LAST_REQUEST.get().path());
+    }
+
+    @Test
+    @DisplayName("v2.6：withHeadersFooters -> 查询串携带 headers_footers（缺省不携带）")
+    void headersFootersQuery() {
+        respondJson(200, """
+                {"markdown":"x","format":"docx","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false}
+                """);
+        client.convert(DOC, "a.docx", ConvertOptions.defaults().withHeadersFooters(false));
+        String path = LAST_REQUEST.get().path();
+        assertTrue(path.contains("headers_footers=false"), path);
+        assertTrue(ConvertOptions.defaults().withHeadersFooters(false)
+                .variantFingerprint().contains("hf=false"));
+        // 缺省不携带（跟随服务端开关）
+        client.convert(DOC, "b.docx", ConvertOptions.defaults());
+        assertTrue(!LAST_REQUEST.get().path().contains("headers_footers"),
+                LAST_REQUEST.get().path());
+    }
+
+    @Test
+    @DisplayName("v2.6：响应 headers_footers/headers_footers_stripped -> 结构化解析")
+    void headersFootersParsing() {
+        respondJson(200, """
+                {"markdown":"正文","format":"docx","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false,
+                 "headers_footers":[
+                   {"kind":"header","scope":"default","location":"center",
+                    "text":"ACME 科技 · 机密","sections":[0],"source":"docx"},
+                   {"kind":"header","scope":"default","location":"image","text":"公司徽标",
+                    "sections":[0],"source":"docx",
+                    "image":{"origin_part":"word/media/image1.png",
+                             "media_type":"image/png","alt":"公司徽标",
+                             "size":8,"data_b64":"QUJDREVGR0g=","truncated":false}},
+                   {"kind":"footer","scope":"default","location":"center",
+                    "text":"文档编号 ACME-2026-001 · 第 {PAGE} 页","sections":[0],"source":"docx"}],
+                 "headers_footers_stripped":12}
+                """);
+        ConversionResult r = client.convert(DOC, "a.docx", ConvertOptions.defaults());
+        assertTrue(r.hasHeadersFooters());
+        assertEquals(3, r.headersFooters().size());
+        HeaderFooterInfo hdr = r.headersFooters().get(0);
+        assertTrue(hdr.isHeader());
+        assertEquals("center", hdr.location());
+        assertEquals("ACME 科技 · 机密", hdr.text());
+        // v2.7/v2.8：页眉图片结构化引用（含字节与大小）
+        HeaderFooterInfo img = r.headersFooters().get(1);
+        assertEquals("image", img.location());
+        assertEquals("word/media/image1.png", img.image().originPart());
+        assertEquals("image/png", img.image().mediaType());
+        assertEquals("公司徽标", img.image().alt());
+        assertEquals(8, img.image().size());
+        assertTrue(img.image().hasData());
+        assertArrayEquals("ABCDEFGH".getBytes(StandardCharsets.UTF_8), img.image().data());
+        assertTrue(!img.image().isTruncated());
+        assertTrue(r.headersFooters().get(2).isFooter());
+        assertEquals(12, r.headersFootersStripped());
+        assertEquals(3, r.headerFooterTexts().size());
+        // pdf 页码型条目解析
+        respondJson(200, """
+                {"markdown":"正文","format":"pdf","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false,
+                 "headers_footers":[
+                   {"kind":"footer","scope":"all","location":"bottom","text":"Page 1 of 6",
+                    "pages_seen":6,"page_frequency":1.0,"page_number":true,"source":"pdf"}],
+                 "headers_footers_stripped":6}
+                """);
+        ConversionResult p = client.convert(DOC, "b.pdf", ConvertOptions.defaults());
+        assertTrue(p.headersFooters().get(0).isPageNumber());
+        assertEquals(6, p.headersFooters().get(0).pagesSeen());
+        assertEquals(1.0, p.headersFooters().get(0).pageFrequency());
+    }
+
+    @Test
+    @DisplayName("v2.1：withUseCache/withPages -> 查询串携带 use_cache/pages")
+    void dynamicCacheAndPagesQuery() {
+        respondJson(200, """
+                {"markdown":"x","format":"pdf","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false}
+                """);
+        client.convert(DOC, "a.pdf", ConvertOptions.defaults()
+                .withUseCache(false).withPages("0-2"));
+        String path = LAST_REQUEST.get().path();
+        assertTrue(path.contains("use_cache=false"), path);
+        assertTrue(path.contains("pages=0-2"), path);
+    }
+
+    @Test
+    @DisplayName("v2.0：withTimeoutSeconds -> 查询串携带 timeout")
+    void timeoutQueryParam() {
+        respondJson(200, """
+                {"markdown":"x","format":"pdf","elapsed_ms":3.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false}
+                """);
+        client.convert(DOC, "a.pdf", ConvertOptions.defaults().withTimeoutSeconds(600));
+        assertTrue(LAST_REQUEST.get().path().contains("timeout=600"), LAST_REQUEST.get().path());
+    }
+
+    @Test
+    @DisplayName("v2.0：不设置动态参数 -> 查询串不携带（保持服务端默认）")
+    void dynamicOcrParamsAbsent() {
+        respondJson(200, """
+                {"markdown":"x","format":"docx","elapsed_ms":1.0,"input_bytes":3,
+                 "assets":[],"cache_hit":false}
+                """);
+        client.convert(DOC, "a.docx", ConvertOptions.defaults());
+        assertEquals("/v1/convert", LAST_REQUEST.get().path());
     }
 
     @Test

@@ -21,8 +21,9 @@ import java.util.List;
  * @param truncated   data 是否因超限/非图片而缺省
  * @param data        图片字节（可能为 null）
  * @param placements  文档流中的出现位置列表（同一资产可出现多次）
- * @param ocrText     图片内文字的本地 OCR 识别结果（v1.5，服务端开启内嵌图片 OCR
- *                    时携带；未开启时字段缺席 → null；识别失败为 null；无文字为空串）
+ * @param floating    v2.1：docx 浮动图片（wp:anchor）标记——其 XML 锚点位置可能与
+ *                    视觉位置不一致（常见整体偏移一个章节），headingPath 归属需谨慎采信；
+ *                    非浮动/非 docx 时该字段缺席（null）
  */
 public record AssetInfo(
         @JsonProperty("id") int id,
@@ -32,15 +33,15 @@ public record AssetInfo(
         @JsonProperty("truncated") boolean truncated,
         @JsonProperty("data_b64") byte[] data,
         @JsonProperty("placements") List<AssetPlacement> placements,
-        @JsonProperty("ocr_text") String ocrText) {
+        @JsonProperty("floating") Boolean floating) {
+
+    /** 是否为浮动图片（wp:anchor，headingPath 归属可能偏移）。 */
+    public boolean isFloating() {
+        return Boolean.TRUE.equals(floating);
+    }
 
     public boolean isImage() {
         return mediaType != null && mediaType.startsWith("image/");
-    }
-
-    /** 是否携带服务端本地 OCR 识别出的图片文字（非空文本）。 */
-    public boolean hasOcrText() {
-        return ocrText != null && !ocrText.isBlank();
     }
 
     /** 是否携带可用于 OCR/VLM 增强的图片字节。 */

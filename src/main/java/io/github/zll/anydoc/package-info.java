@@ -16,7 +16,7 @@
  *     ConversionResult result = client.convert(bytes, "report.docx");
  *     String markdown = result.markdown();
  * } catch (UnsupportedDocumentException e) {
- *     // 415：扫描件/未知格式 → 转 OCR 兜底队列
+ *     // 415：未知格式/无文本层扫描件 → 死信（扫描件由上游 OCR 服务预处理）
  * } catch (EncryptedDocumentException e) {
  *     // 422：加密文档 → 隔离并通知所有者
  * } catch (CorruptedDocumentException e) {

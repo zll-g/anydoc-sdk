@@ -16,7 +16,7 @@ import java.util.Objects;
  *         .baseUrl("http://anydoc-service:8080")
  *         .token(token)
  *         .connectTimeout(Duration.ofSeconds(2))
- *         .requestTimeout(Duration.ofSeconds(10))
+ *         .requestTimeout(Duration.ofSeconds(30))
  *         .retry(RetryPolicy.of(3, Duration.ofMillis(300), 2.0))
  *         .build();
  * }</pre>
@@ -26,7 +26,7 @@ public final class AnydocClientBuilder {
     private String baseUrl;
     private String token;
     private Duration connectTimeout = Duration.ofSeconds(2);
-    private Duration requestTimeout = Duration.ofSeconds(10);
+    private Duration requestTimeout = Duration.ofSeconds(30);
     private RetryPolicy retryPolicy = RetryPolicy.defaults();
     private CircuitBreaker.CircuitBreakerConfig circuitBreakerConfig = CircuitBreaker.CircuitBreakerConfig.defaults();
     private final List<ConversionListener> listeners = new ArrayList<>();

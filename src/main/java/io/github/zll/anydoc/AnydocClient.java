@@ -21,7 +21,7 @@ public interface AnydocClient extends AutoCloseable {
      * @param content  文档二进制内容（非空）
      * @param filename 原始文件名（用于 CSV 等无签名格式的扩展名兜底识别，可为 null）
      * @return 转换结果
-     * @throws io.github.zll.anydoc.exception.UnsupportedDocumentException 415：未知格式/扫描件（应转 OCR 兜底）
+     * @throws io.github.zll.anydoc.exception.UnsupportedDocumentException 415：未知格式/无文本层扫描件（由上游 OCR 服务预处理）
      * @throws io.github.zll.anydoc.exception.EncryptedDocumentException   422：加密文档
      * @throws io.github.zll.anydoc.exception.CorruptedDocumentException   422：损坏/缺部件/触发安全上限
      * @throws io.github.zll.anydoc.exception.DocumentTooLargeException    413：超过服务端大小上限
@@ -45,24 +45,20 @@ public interface AnydocClient extends AutoCloseable {
      */
     ConversionResult convert(byte[] content, String filename, ConvertOptions options);
 
+
     /**
-     * 独立 OCR（v1.6）：对单张图片（png/jpeg/gif/bmp/tiff/webp）或 PDF 直接调用
-     * 服务端本地 OCR（数据不出域），返回识别文本。
-     *
-     * <p>与 {@link #convert(byte[], String)} 的区别：不做格式转换/资产解析，
-     * 仅输出文字识别结果，适合纯截图识别、扫描件批量补录等场景。
-     * 引擎不可用（415 ocr_unavailable）等错误按标准异常契约抛出。
-     *
-     * @param content  图片/PDF 字节
-     * @param filename 文件名（仅用于 multipart 字段与日志）
+     * PDF 页面位图渲染（v1.8）：把指定页渲染为图片字节返回
+     * （服务端 pypdfium2；用途：预览/抽检/向 VLM 供图）。
      */
-    OcrResult ocr(byte[] content, String filename);
+    PdfRenderResult renderPdf(byte[] content, RenderOptions options);
 
-    /** 独立 OCR（携带链路追踪 ID）。 */
-    OcrResult ocr(byte[] content, String filename, String requestId);
+    /** PDF 页面位图渲染（默认选项：全部页、2x、PNG）。 */
+    default PdfRenderResult renderPdf(byte[] content) {
+        return renderPdf(content, RenderOptions.defaults());
+    }
 
     /**
-     * 提交异步转换任务（v1.7）：面向大文档/多页扫描 OCR 等长任务。
+     * 提交异步转换任务（v1.7）：面向大文档等长任务。
      *
      * <p>服务端返回 202 + 任务 ID；命中转换缓存时任务直接完成
      * （{@link JobTicket#isDone()}）。任务结果经
